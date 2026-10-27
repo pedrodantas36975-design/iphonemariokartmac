@@ -1,3 +1,22 @@
+# 🏎️ Mario Kart 8 Deluxe (Mac Native) + Controles Wi-Fi para iPhone
+
+> **Instalador Automatizado em 1 Clique**: Converta e jogue Mario Kart 8 Deluxe nativamente no macOS (Apple Silicon M1/M2/M3/M4) com suporte a até 4 jogadores simultâneos controlando pelo Safari do iPhone ou Android via Wi-Fi!
+
+### 🚀 Início Rápido (Quick Start)
+1. Extraia os arquivos do seu próprio Nintendo Switch (`[0100152000022000].nsz`, update e `prod.keys`).
+2. Execute o instalador no Terminal do Mac:
+   ```bash
+   ./build_mariokart.sh
+   ```
+3. O instalador configura todas as dependências, compila o jogo, injeta o servidor de controles Web e gera os atalhos prontos na Mesa:
+   - 🎮 **`Mario Kart 8 Deluxe.app`** (Executa o jogo a 60 FPS com gráficos Metal).
+   - 📱 **`Controles Mario Kart.app`** (Abre o QR Code dinâmico para os celulares conectarem).
+   - 🛑 **`Encerrar Jogo.app`** (Fecha o jogo e os controles com 1 clique).
+
+📖 **Tutorial detalhado em português:** Veja o guia passo a passo em [README_MARIO_KART.md](README_MARIO_KART.md).
+
+---
+
 # nxnative
 
 Play your own Nintendo Switch games natively on iPhone and iPad. Bring your game (its NSP files) and your `prod.keys`; one script turns them into an IPA that you sideload.
