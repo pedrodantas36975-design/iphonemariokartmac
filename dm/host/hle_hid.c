@@ -7,6 +7,7 @@
 #include "hle.h"
 #include "hle_haptics.h"
 #include "dm_input.h"
+#include "net_controller.h"
 #include "front.h"
 #include <stdatomic.h>
 #include <unistd.h>
@@ -99,8 +100,11 @@ static void parse_keys(char *spec, key_step *st) {
         k = plus ? plus + 1 : NULL; }
 }
 static void ctl_start(void);
+static void hle_hid_on_netpad_change(int p);
 void hid_keys_init(void) {
     ctl_start();
+    net_controller_set_change_callback(hle_hid_on_netpad_change);
+    net_controller_init();
     const char *e = getenv("DM_KEYS"); if (!e || !*e) return;
     char buf[4096]; snprintf(buf, sizeof buf, "%s", e);
     for (char *tok = strtok(buf, ","); tok && g_nsteps < KEY_STEPS; tok = strtok(NULL, ",")) {
@@ -175,7 +179,23 @@ static void ctl_start(void) {
     pthread_t th; if (!pthread_create(&th, NULL, ctl_main, strdup(e))) { pthread_detach(th); LOG("DM_CTL: reading key presses and screenshot requests from %s", e); }
 }
 
-static uint32_t connected_id(void) { return dm_opmode() == 0 ? NPAD_HANDHELD : NPAD_NO1; }
+static _Atomic int g_applet_forced_players = 0;
+
+static void style_changed(uint32_t id);
+static void note_merged(void);
+
+static void hle_hid_on_netpad_change(int p) {
+    if (p >= 0 && p < DM_PLAYERS) {
+        style_changed((uint32_t)p);
+        dm_haptics_clear(p);
+    }
+    note_merged();
+}
+
+static uint32_t connected_id(void) {
+    if (dm_opmode() != 0 || atomic_load(&g_applet_forced_players) > 1) return NPAD_NO1;
+    return NPAD_HANDHELD;
+}
 uint32_t hle_hid_connected_npad(void) { return connected_id(); }   // nfp's NFC device sits on player 1's controller (hle_sdk16.c)
 // Player n is on No n in handheld mode too, where No1 stays empty: games take Handheld and No1 both for player 1, so a second controller on No1 would act as player 1 again
 uint32_t dm_player_npad(int p) { return p <= 0 ? connected_id() : (uint32_t)p; }
@@ -183,7 +203,16 @@ uint32_t dm_player_npad(int p) { return p <= 0 ? connected_id() : (uint32_t)p; }
 // Handheld, bit 9 Other: all of them until SetSupportedNpadIdType, as the hid service starts)
 static _Atomic uint32_t g_players = 1, g_ids_supported = 0x3ff;
 static uint32_t id_bit(uint32_t id) { return id < DM_PLAYERS ? 1u << id : id == NPAD_HANDHELD ? 1u << 8 : id == 0x10 ? 1u << 9 : 0; }
-static int reported(int p) { return p == 0 || (atomic_load(&g_players) >> p & 1 && atomic_load(&g_ids_supported) & id_bit((uint32_t)p)); }
+static int reported(int p) {
+    if (p < 0 || p >= DM_PLAYERS) return 0;
+    if (p == 0) return 1;
+    uint32_t netpad_m = net_controller_player_mask();
+    int active = (atomic_load(&g_players) >> p & 1) ||
+                 (netpad_m >> p & 1) ||
+                 (p < atomic_load(&g_applet_forced_players)) ||
+                 net_controller_is_force_connect(p);
+    return active && (atomic_load(&g_ids_supported) & id_bit((uint32_t)p));
+}
 // Players with a controller whose npad the game does not support. A one-player game (no npad past No1 supported) gets them as player 1, so any controller plays it; in a game for
 // fewer players than are connected (a fifth controller in a four-player game) they are not used, as on the Switch, where the system does not connect them
 static uint32_t unsupported_players(void) {
@@ -193,10 +222,27 @@ static uint32_t unsupported_players(void) {
 static int one_player(void) { return !(atomic_load(&g_ids_supported) & ((1u << DM_PLAYERS) - 2)); }
 static uint32_t merged_players(void) { return one_player() ? unsupported_players() : 0; }
 static int player_of(uint32_t id) {   // the reported player on npad id; -1 when none
-    if (id == connected_id()) return 0;
+    if (id == NPAD_HANDHELD) {
+        if (dm_opmode() != 0 || atomic_load(&g_applet_forced_players) > 1 || connected_id() != NPAD_HANDHELD) return -1;
+        return 0;
+    }
+    if (id == NPAD_NO1) {
+        if (connected_id() == NPAD_NO1) return 0;
+        return -1;
+    }
     return id > 0 && id < DM_PLAYERS && reported((int)id) ? (int)id : -1;
 }
-static uint32_t style_of(uint32_t id) { return player_of(id) < 0 ? 0 : id == NPAD_HANDHELD ? STYLE_HANDHELD : STYLE_FULLKEY; }
+static uint32_t g_styles_supported = 0xffffffffu;
+static uint32_t style_of(uint32_t id) {
+    if (id == NPAD_HANDHELD) {
+        if (dm_opmode() != 0 || player_of(NPAD_NO1) >= 0) return 0;
+        return player_of(id) >= 0 ? ((g_styles_supported & STYLE_HANDHELD) ? STYLE_HANDHELD : 0) : 0;
+    }
+    if (player_of(id) < 0) return 0;
+    if (g_styles_supported & STYLE_FULLKEY) return STYLE_FULLKEY;
+    if (g_styles_supported & STYLE_JOYDUAL) return STYLE_JOYDUAL;
+    return STYLE_FULLKEY;
+}
 static int32_t ax(uint64_t v, int i) { return (int16_t)(v >> (16 * i)); }
 static int32_t pick(int32_t a, int32_t b) { return (a < 0 ? -a : a) >= (b < 0 ? -b : b) ? a : b; }   // whichever of two sources is deflected more
 
@@ -213,6 +259,7 @@ static void note_merged(void) {   // logs the players whose npad the game does n
     }
 }
 void dm_pad_players(uint32_t mask) {
+    atomic_store(&g_applet_forced_players, 0);
     mask = (mask | 1u) & ((1u << DM_PLAYERS) - 1);
     uint32_t old = atomic_exchange(&g_players, mask);
     for (int p = 1; p < DM_PLAYERS; p++) if ((old ^ mask) >> p & 1) {
@@ -225,7 +272,12 @@ void dm_pad_players(uint32_t mask) {
 static void fill(NpadState *s, uint32_t id, uint32_t style) {
     memset(s, 0, sizeof *s);
     s->sampling = atomic_fetch_add(&g_sampling, 1) + 1;
-    if (!(style_of(id) & style)) return;   // no controller of this id / style: attributes = 0
+    uint32_t st = style_of(id);
+    if (!st) return;
+    if (id != NPAD_HANDHELD && (style & (STYLE_FULLKEY | STYLE_JOYDUAL))) {
+        if (g_styles_supported & style) st |= style;
+    }
+    if (!(st & style)) return;   // no controller of this id / style: attributes = 0
     // Player 1: the keyboard / touch path, its controller path and those of the players merged into it; another player: its own controller path
     int pl = player_of(id); uint32_t src = pl ? 1u << pl : 1u | merged_players();
     uint64_t b = 0; int32_t a[4] = {0};
@@ -233,6 +285,14 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     for (int p = 0; p < DM_PLAYERS; p++) if (src >> p & 1) {
         b |= atomic_load(&g_pad_btn[p]) | atomic_exchange(&g_pad_latch[p], 0);
         uint64_t v = atomic_load(&g_pad_axes[p]); for (int i = 0; i < 4; i++) a[i] = pick(a[i], ax(v, i));
+        NetPadPlayerState net_st;
+        if (net_controller_get_state(p, &net_st) && net_st.connected) {
+            b |= net_st.buttons;
+            a[0] = pick(a[0], net_st.stick_l_x);
+            a[1] = pick(a[1], net_st.stick_l_y);
+            a[2] = pick(a[2], net_st.stick_r_x);
+            a[3] = pick(a[3], net_st.stick_r_y);
+        }
     }
     s->lx = a[0]; s->ly = a[1]; s->rx = a[2]; s->ry = a[3];
     b &= 0xffffull;
@@ -245,7 +305,7 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     if (s->rx > STICK_THRESH) b |= 1u << 22;
     if (s->ry < -STICK_THRESH) b |= 1u << 23;
     s->buttons = b;
-    s->attributes = ATTR_CONNECTED | (id == NPAD_HANDHELD ? ATTR_WIRED | ATTR_LEFT_CONN | ATTR_LEFT_WIRED | ATTR_RIGHT_CONN | ATTR_RIGHT_WIRED : ATTR_LEFT_CONN | ATTR_RIGHT_CONN);
+    s->attributes = ATTR_CONNECTED | ATTR_WIRED | ATTR_LEFT_CONN | ATTR_LEFT_WIRED | ATTR_RIGHT_CONN | ATTR_RIGHT_WIRED;
 }
 // GetNpadStates(out, n, id): newest first, n entries: the current state repeated with consecutive sampling numbers. The host keeps no history, but on hardware the
 // 16-entry history is always full, and games read all of it whatever count comes back: Super Mario Odyssey (main+0x93fc20) polls every controller slot each frame, which advances
@@ -262,6 +322,7 @@ HLE_FORCE("_ZN2nn3hid14InitializeNpadEv", "connect to the hid service; the host 
 // Supported npad ids: players 2..8 are reported only on supported npads; a one-player game ({No1, Handheld}) gets every controller as player 1 (merged_players); a four-player
 // game ({No1..No4, Handheld}) gets players 1..4, and a fifth controller is not used
 HLE_FORCE("_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm", "supported controller ids; the host records them and reports further players only on supported ids", void, h_hid_SetIds, const uint32_t *ids, uint64_t n) {
+    atomic_store(&g_applet_forced_players, 0);
     uint32_t m = 0; for (uint64_t i = 0; ids && i < n; i++) m |= id_bit(ids[i]);
     uint32_t was = 0; for (int p = 1; p < DM_PLAYERS; p++) was |= (uint32_t)reported(p) << p;
     if (atomic_exchange(&g_ids_supported, m) == m) return;
@@ -270,7 +331,6 @@ HLE_FORCE("_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm", "supported controller ids; 
     for (int p = 1; p < DM_PLAYERS; p++) if ((uint32_t)reported(p) != (was >> p & 1)) style_changed((uint32_t)p);
     note_merged();
 }
-static uint32_t g_styles_supported = 0xffffffffu;
 HLE_FORCE("_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "supported controller styles; the host records them and picks the reported style from them", void, h_hid_SetStyles, uint32_t styles) {
     if (styles != g_styles_supported) LOG("hid supported controller styles %#x", styles); g_styles_supported = styles; }
 HLE_FORCE("_ZN2nn3hid15GetNpadStyleSetERKj", "controller style query; follows DM_OPMODE", uint32_t, h_hid_GetStyle, const uint32_t *id) { return style_of(*id); }
@@ -287,15 +347,86 @@ HLE_FORCE("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKj", "Joy-Con single assi
 HLE_FORCE("_ZN2nn3hid18SwapNpadAssignmentERKjS2_", "swap controller ids; ignored by the host", void, h_hid_Swap, const uint32_t *a, const uint32_t *b) { (void)a; (void)b; }
 HLE_FORCE("_ZN2nn3hid21StartLrAssignmentModeEv", "L/R assignment mode; ignored by the host", void, h_hid_LrStart, void) {}
 HLE_FORCE("_ZN2nn3hid20StopLrAssignmentModeEv", "L/R assignment mode; ignored by the host", void, h_hid_LrStop, void) {}
-// Controller applet (system UI): report the connected players right away, with player 1's controller selected. ControllerSupportResultInfo = { int playerCount; uint32_t selectedId; };
-// ControllerSupportArg starts with { int8 playerCountMin, playerCountMax }: the count is capped at the maximum (a min the connected players do not reach is not waited for, as before)
-HLE_FORCE("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE", "controller applet; the host reports the connected players right away",
-          Result, h_hid_ShowCtrl, int32_t *info, const int8_t *arg) {
-    int count = 0; for (int p = 0; p < DM_PLAYERS; p++) count += reported(p);
-    if (arg && arg[1] > 0 && count > arg[1]) count = arg[1];
-    if (info) { info[0] = count; info[1] = (int32_t)connected_id(); }
+static Result handle_show_controller_support(int32_t *info, const int8_t *arg) {
+    int min_players = (arg && arg[0] > 0) ? (int)arg[0] : 1;
+    int max_players = (arg && arg[1] > 0) ? (int)arg[1] : DM_PLAYERS;
+    if (max_players < min_players) max_players = min_players;
+    if (max_players > DM_PLAYERS) max_players = DM_PLAYERS;
+    if (min_players > DM_PLAYERS) min_players = DM_PLAYERS;
+
+    int current_count = 0;
+    for (int p = 0; p < DM_PLAYERS; p++) current_count += reported(p);
+
+    if (min_players > current_count) {
+        atomic_store(&g_applet_forced_players, min_players);
+        for (int p = current_count; p < min_players; p++) {
+            style_changed((uint32_t)p);
+        }
+        note_merged();
+    }
+
+    int final_count = 0;
+    for (int p = 0; p < DM_PLAYERS; p++) final_count += reported(p);
+    if (final_count < min_players) final_count = min_players;
+    if (final_count > max_players) final_count = max_players;
+
+    if (info) {
+        info[0] = final_count;
+        info[1] = (arg != NULL || dm_opmode() != 0) ? (int32_t)NPAD_NO1 : (int32_t)connected_id();
+    }
+    LOG("hid: ShowControllerSupport min=%d max=%d -> count=%d, selected=%d",
+        min_players, max_players, final_count, info ? info[1] : 0);
     return RES_OK;
 }
+
+HLE_FORCE("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE", "controller applet; the host reports the connected players right away",
+          Result, h_hid_ShowCtrl, int32_t *info, const int8_t *arg) {
+    return handle_show_controller_support(info, arg);
+}
+HLE_FORCE("_ZN2nn3hid21ShowControllerSupportERKNS0_20ControllerSupportArgE", "controller applet (no result wanted); the host reports a selection right away",
+          Result, h_hid_ShowCtrl0, const int8_t *arg) {
+    return handle_show_controller_support(NULL, arg);
+}
+HLE_FORCE("_ZN2nn3hid6system30ShowControllerSupportForSystemEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgEb", "controller applet for system; non-blocking bypass",
+          Result, h_hid_ShowCtrlSys, int32_t *info, const int8_t *arg, unsigned caller) {
+    (void)caller; return handle_show_controller_support(info, arg);
+}
+HLE_FORCE("_ZN2nn3hid6system30ShowControllerSupportForSystemERKNS0_20ControllerSupportArgEb", "controller applet for system (no result); non-blocking bypass",
+          Result, h_hid_ShowCtrlSys0, const int8_t *arg, unsigned caller) {
+    (void)caller; return handle_show_controller_support(NULL, arg);
+}
+HLE_FORCE("_ZN2nn3hid6detail25ShowControllerSupportCoreEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgERKNS0_6system27ControllerSupportArgPrivateE", "controller applet core; non-blocking bypass",
+          Result, h_hid_ShowCtrlCore, int32_t *info, const int8_t *arg, const void *priv) {
+    (void)priv; return handle_show_controller_support(info, arg);
+}
+HLE_FORCE("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_23ControllerSupportArgV55E", "controller applet V55; non-blocking bypass",
+          Result, h_hid_ShowCtrlV55, int32_t *info, const int8_t *arg) {
+    return handle_show_controller_support(info, arg);
+}
+HLE_FORCE("_ZN2nn3hid21ShowControllerSupportERKNS0_23ControllerSupportArgV55E", "controller applet V55 (no result); non-blocking bypass",
+          Result, h_hid_ShowCtrlV55_0, const int8_t *arg) {
+    return handle_show_controller_support(NULL, arg);
+}
+HLE_FORCE("_ZN2nn3hid6system30ShowControllerSupportForSystemEPNS0_27ControllerSupportResultInfoERKNS0_23ControllerSupportArgV55Eb", "controller applet for system V55; non-blocking bypass",
+          Result, h_hid_ShowCtrlSysV55, int32_t *info, const int8_t *arg, unsigned caller) {
+    (void)caller; return handle_show_controller_support(info, arg);
+}
+HLE_FORCE("_ZN2nn3hid6system30ShowControllerSupportForSystemERKNS0_23ControllerSupportArgV55Eb", "controller applet for system V55 (no result); non-blocking bypass",
+          Result, h_hid_ShowCtrlSysV55_0, const int8_t *arg, unsigned caller) {
+    (void)caller; return handle_show_controller_support(NULL, arg);
+}
+HLE_FORCE("_ZN2nn3hid24ShowControllerStrapGuideEv", "strap guide applet; not shown by the host",
+          Result, h_hid_Strap, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn3hid28ShowControllerFirmwareUpdateERKNS0_27ControllerFirmwareUpdateArgE", "controller firmware update applet; not shown by the host",
+          Result, h_hid_FwUpd, const void *arg) { (void)arg; return RES_OK; }
+HLE_FORCE("_ZN2nn3hid6system37ShowControllerFirmwareUpdateForSystemERKNS0_27ControllerFirmwareUpdateArgENS1_23ControllerSupportCallerE", "controller firmware update for system; not shown by the host",
+          Result, h_hid_FwUpdSys, const void *arg, unsigned caller) { (void)arg; (void)caller; return RES_OK; }
+HLE_FORCE("_ZN2nn3hid34ShowControllerKeyRemappingForSystemERKNS0_24ControllerKeyRemappingArgE", "controller key remapping applet; not shown by the host",
+          Result, h_hid_KeyRemap, const void *arg) { (void)arg; return RES_OK; }
+HLE_FORCE("_ZN2nn3hid6detail45BindDeviceRegisteredEventForControllerSupportEPNS_2os15SystemEventTypeENS2_14EventClearModeE", "controller support device registered event (core)",
+          void, h_hid_BindDevRegCore, void *ev, int clear) { hle_bind_system_event(ev, clear); }
+HLE_FORCE("_ZN2nn3hid6system45BindDeviceRegisteredEventForControllerSupportEPNS_2os15SystemEventTypeENS2_14EventClearModeE", "controller support device registered event (system)",
+          void, h_hid_BindDevRegSys, void *ev, int clear) { hle_bind_system_event(ev, clear); }
 // Six-axis sensor (accelerometer + gyroscope) of the connected controller. SixAxisSensorState (0x60): acceleration in G, angular velocity in revolutions / s, angle in revolutions,
 // direction = the controller's three axes. At rest it lies flat: gravity (0, 0, -1), no rotation, the identity direction. While shaking (DM_BTN_SHAKE: the iPhone shaken, DmGamepad.m;
 // Space on the Mac; DM_KEYS Shake) it moves side to side, x acceleration ±SHAKE_G with a yaw of ±SHAKE_REV, in whole cycles that end where they began. Samples are 5 ms apart on the
@@ -457,9 +588,6 @@ HLE_FORCE("_ZN2nn3hid19GetPlayerLedPatternERKj", "player LED: the Switch's patte
 static void ctrl_color(uint32_t *c) { c[0] = 0xff828282u; c[1] = 0xff0f0f0fu; }
 HLE_FORCE("_ZN2nn3hid22GetNpadControllerColorEPNS0_19NpadControllerColorERKj", "controller color", Result, h_hid_Color, uint32_t *c, const uint32_t *id) { (void)id; ctrl_color(c); return RES_OK; }
 HLE_FORCE("_ZN2nn3hid22GetNpadControllerColorEPNS0_19NpadControllerColorES2_RKj", "left and right Joy-Con colors", Result, h_hid_Color2, uint32_t *l, uint32_t *r, const uint32_t *id) { (void)id; ctrl_color(l); ctrl_color(r); return RES_OK; }
-HLE_FORCE("_ZN2nn3hid21ShowControllerSupportERKNS0_20ControllerSupportArgE", "controller applet (no result wanted); the host reports a selection right away", Result, h_hid_ShowCtrl0, const void *arg) { (void)arg; return RES_OK; }
-HLE_FORCE("_ZN2nn3hid24ShowControllerStrapGuideEv", "strap guide applet; not shown by the host", Result, h_hid_Strap, void) { return RES_OK; }
-HLE_FORCE("_ZN2nn3hid28ShowControllerFirmwareUpdateERKNS0_27ControllerFirmwareUpdateArgE", "controller firmware update applet; not shown by the host", Result, h_hid_FwUpd, const void *arg) { (void)arg; return RES_OK; }
 
 // Touch screen: TouchScreenState<N> = { int64 sampling number; int32 count; int32 reserved; TouchState[N] }, filled from the front end's touch points (hle_touch.c touch_fill_n:
 // the Mac's mouse, the iPhone touches no gamepad control takes, DM_KEYS taps) in handheld mode, as on the Switch, whose screen is out of reach when docked: a game may read touches

@@ -206,10 +206,103 @@ static void t_rumble_log(void) {
     unsetenv("DM_RUMBLE_LOG");
 }
 
+static void t_controller_support(void) {
+    // Docked mode, game supports No1..No4 and Handheld (like Mario Kart 8 Deluxe: 0x10f)
+    g_mode = 1;
+    ids((const uint32_t[]){0, 1, 2, 3, NPAD_HANDHELD}, 5);
+    dm_pad_players(1); // Only 1 physical player connected initially
+
+    // 1) Test ShowControllerSupport requesting 2 players (e.g. 2P split-screen in MK8D)
+    int32_t info[2] = {0, -1};
+    int8_t arg2[8] = {2, 4}; // min=2, max=4
+    Result res = h_hid_ShowCtrl(info, arg2);
+    CHECK(res == RES_OK, "ShowControllerSupport returns RES_OK");
+    CHECK(info[0] >= 2, "ShowControllerSupport ensures at least minPlayerCount (2)");
+    CHECK(info[1] == 0, "ShowControllerSupport selectedId is NpadId::No1 (0)");
+    CHECK(reported(0) == 1 && reported(1) == 1, "both No1 and No2 slots are reported as connected");
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == STYLE_FULLKEY, "No1 has FullKey style in docked mode");
+    CHECK(h_hid_GetStyle(&(uint32_t){1}) == STYLE_FULLKEY, "No2 has FullKey style in docked mode");
+    CHECK(h_hid_GetStyle(&(uint32_t){NPAD_HANDHELD}) == 0, "Handheld is disconnected when No1 is active or multiplayer");
+
+    // Verify ring buffer states for No1 and No2 have connection attributes
+    NpadState st0, st1;
+    fill(&st0, 0, STYLE_FULLKEY);
+    fill(&st1, 1, STYLE_FULLKEY);
+    CHECK((st0.attributes & ATTR_CONNECTED) && (st0.attributes & ATTR_WIRED), "No1 attributes show connected and wired");
+    CHECK((st1.attributes & ATTR_CONNECTED) && (st1.attributes & ATTR_WIRED), "No2 attributes show connected and wired");
+
+    // 2) Test ShowControllerSupport requesting 4 players (4P multiplayer in MK8D)
+    int8_t arg4[8] = {4, 4}; // min=4, max=4
+    res = h_hid_ShowCtrl(info, arg4);
+    CHECK(res == RES_OK, "ShowControllerSupport 4P returns RES_OK");
+    CHECK(info[0] == 4, "ShowControllerSupport reports 4 players");
+    CHECK(info[1] == 0, "ShowControllerSupport 4P selectedId is No1");
+    for (int p = 0; p < 4; p++) {
+        CHECK(reported(p) == 1, "Player 1..4 slots reported connected");
+        CHECK(h_hid_GetStyle(&(uint32_t){(uint32_t)p}) == STYLE_FULLKEY, "Player 1..4 have FullKey style");
+    }
+
+    // 3) Test non-blocking overloads without result pointer
+    CHECK(h_hid_ShowCtrl0(arg4) == RES_OK, "ShowControllerSupport without result returns RES_OK");
+    CHECK(h_hid_Strap() == RES_OK, "ShowControllerStrapGuide returns RES_OK");
+    CHECK(h_hid_FwUpd(NULL) == RES_OK, "ShowControllerFirmwareUpdate returns RES_OK");
+    CHECK(h_hid_KeyRemap(NULL) == RES_OK, "ShowControllerKeyRemappingForSystem returns RES_OK");
+}
+
+static void t_net_controller(void) {
+    g_mode = 1;
+    ids((const uint32_t[]){0, 1, 2, 3, NPAD_HANDHELD}, 5);
+    dm_pad_players(1); // physical pad only player 1
+
+    // 1) NetPad direct state injection for P1..P4
+    net_controller_set_state(0, true, DM_BTN_A | DM_BTN_ZR, 10000, 20000, 0, 0);
+    net_controller_set_state(1, true, DM_BTN_B | DM_BTN_ZL, -15000, -25000, 0, 0);
+    net_controller_set_state(2, true, DM_BTN_X | DM_BTN_R, 30000, 0, 0, 0);
+    net_controller_set_state(3, true, DM_BTN_Y | DM_BTN_L, -30000, 0, 0, 0);
+
+    CHECK(net_controller_player_mask() == 0x0F, "NetPad player mask reports 4 connected players");
+    for (int p = 0; p < 4; p++) {
+        CHECK(reported(p) == 1, "NetPad players are reported in hid");
+    }
+
+    // Verify input reflection in fill() for each player slot
+    NpadState s0, s1, s2, s3;
+    fill(&s0, 0, STYLE_FULLKEY);
+    fill(&s1, 1, STYLE_FULLKEY);
+    fill(&s2, 2, STYLE_FULLKEY);
+    fill(&s3, 3, STYLE_FULLKEY);
+
+    CHECK((s0.buttons & (DM_BTN_A | DM_BTN_ZR)) == (DM_BTN_A | DM_BTN_ZR), "Player 1 NetPad buttons A+ZR reflected");
+    CHECK(s0.lx == 10000 && s0.ly == 20000, "Player 1 NetPad left stick reflected");
+
+    CHECK((s1.buttons & (DM_BTN_B | DM_BTN_ZL)) == (DM_BTN_B | DM_BTN_ZL), "Player 2 NetPad buttons B+ZL reflected");
+    CHECK(s1.lx == -15000 && s1.ly == -25000, "Player 2 NetPad left stick reflected");
+
+    CHECK((s2.buttons & (DM_BTN_X | DM_BTN_R)) == (DM_BTN_X | DM_BTN_R), "Player 3 NetPad buttons X+R reflected");
+    CHECK(s2.lx == 30000, "Player 3 NetPad left stick reflected");
+
+    CHECK((s3.buttons & (DM_BTN_Y | DM_BTN_L)) == (DM_BTN_Y | DM_BTN_L), "Player 4 NetPad buttons Y+L reflected");
+    CHECK(s3.lx == -30000, "Player 4 NetPad left stick reflected");
+
+    // 2) Test Force Connect toggle
+    net_controller_set_force_connect(2, true);
+    CHECK(net_controller_is_force_connect(2), "Player 3 force connected");
+    net_controller_set_force_connect(2, false);
+    CHECK(!net_controller_is_force_connect(2), "Player 3 force disconnected");
+
+    // 3) Disconnect NetPad players
+    for (int p = 0; p < 4; p++) {
+        net_controller_set_state(p, false, 0, 0, 0, 0, 0);
+    }
+    CHECK(net_controller_player_mask() == 0, "NetPad player mask cleared after disconnect");
+}
+
 int main(void) {
     CHECK(setenv("DM_RUMBLE_LOG", "1", 1) == 0, "enable rumble diagnostics");
     t_slots();
     t_npads();
+    t_controller_support();
+    t_net_controller();
     t_vibration();
     t_rumble_log();
     printf("hid players: %d checks, %d failed\n", checks, fails);
