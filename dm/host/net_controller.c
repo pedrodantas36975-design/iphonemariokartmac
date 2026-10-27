@@ -239,10 +239,11 @@ static void handle_client_json(ClientConn *c, const char *json) {
             c->assigned_player = p;
             pthread_mutex_lock(&g_lock);
             g_states[p].connected = true;
+            g_force_connected[p] = true;
             pthread_mutex_unlock(&g_lock);
             notify_change(p);
             char resp[64];
-            snprintf(resp, sizeof(resp), "{\"type\":\"assigned\",\"p\":%d}", p);
+            snprintf(resp, sizeof(resp), "{\"type\":\"assigned\",\"p\":%d,\"force\":true}", p);
             send_ws_frame(c->fd, 0x1, resp, strlen(resp));
         }
     } else if (strstr(json, "\"force\"")) {
@@ -265,6 +266,7 @@ static void handle_client_json(ClientConn *c, const char *json) {
         pthread_mutex_lock(&g_lock);
         was_conn = g_states[p].connected || g_force_connected[p];
         g_states[p].connected = true;
+        g_force_connected[p] = true;
         g_states[p].buttons = b;
         g_states[p].stick_l_x = lx;
         g_states[p].stick_l_y = ly;
@@ -290,6 +292,7 @@ static void handle_client_binary(ClientConn *c, const uint8_t *data, size_t len)
     pthread_mutex_lock(&g_lock);
     was_conn = g_states[p].connected || g_force_connected[p];
     g_states[p].connected = true;
+    g_force_connected[p] = true;
     g_states[p].buttons = b;
     g_states[p].stick_l_x = lx;
     g_states[p].stick_l_y = ly;
@@ -389,9 +392,9 @@ static void process_http_data(ClientConn *c, ClientConn *all_clients, int max_c)
     char *headers_end = strstr((char *)c->buf, "\r\n\r\n");
     if (!headers_end) return;
 
-    if (strstr((char *)c->buf, "Upgrade: websocket") || strstr((char *)c->buf, "Upgrade: WebSocket")) {
-        char *key_hdr = strstr((char *)c->buf, "Sec-WebSocket-Key:");
-        if (!key_hdr) key_hdr = strstr((char *)c->buf, "sec-websocket-key:");
+    if (strcasestr((char *)c->buf, "upgrade: websocket") ||
+        (strcasestr((char *)c->buf, "upgrade:") && strcasestr((char *)c->buf, "websocket"))) {
+        char *key_hdr = strcasestr((char *)c->buf, "sec-websocket-key:");
         if (key_hdr) {
             char key[128] = {0};
             key_hdr += 18;
@@ -428,11 +431,12 @@ static void process_http_data(ClientConn *c, ClientConn *all_clients, int max_c)
             c->assigned_player = slot;
             pthread_mutex_lock(&g_lock);
             g_states[slot].connected = true;
+            g_force_connected[slot] = true;
             pthread_mutex_unlock(&g_lock);
             notify_change(slot);
 
             char assign_msg[64];
-            snprintf(assign_msg, sizeof(assign_msg), "{\"type\":\"assigned\",\"p\":%d}", slot);
+            snprintf(assign_msg, sizeof(assign_msg), "{\"type\":\"assigned\",\"p\":%d,\"force\":true}", slot);
             send_ws_frame(c->fd, 0x1, assign_msg, strlen(assign_msg));
 
             size_t consumed = (headers_end + 4) - (char *)c->buf;
